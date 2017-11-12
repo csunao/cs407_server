@@ -1,0 +1,10 @@
+[package]
+name = "cs407_server"
+version = "0.1.0"
+authors = ["Hugh <hugh.r.harrington@dcs.warwick.ac.uk>"]
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+lazy_static = "0.2"
