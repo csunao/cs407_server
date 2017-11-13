@@ -3,10 +3,13 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::CStr;
+use std::os::raw::c_char;
 
 /* API
  * start()
- * send(msg)
+ * send(msg) // sends msg to specific connection
  * poll() -> msg
  * close() */
 
@@ -18,36 +21,33 @@ use std::time;
    When message is found, added to queue.
  */
 
+type ServerHandle = *const Server;
+type ConnId = u8;
+
 pub struct Server {
     threads: Mutex<Vec<thread::JoinHandle<()>>>,
-    connections: Mutex<Vec<Connection>>,
-    queue: Mutex<Vec<Message>>
+    connections: Mutex<HashMap<ConnId, Connection>>,
+    queue: Mutex<VecDeque<Message>>,
+    jobs: Mutex<VecDeque<Job>>
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
-        println!("Server getting dropped *************");
-    }
+enum Job {
+    Send(ConnId, Message)
 }
-
-type ServerHandle = *const Server;
 
 #[derive(Debug)]
 struct Connection {
-    id: u8, // I can't imagine us connecting over 256 mobile devices.
     stream: TcpStream
 }
 
 #[derive(Debug)]
 struct Message {
-    id: u8,
     contents: i32
 }
 
 impl Message {
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.push(self.id);
         let contents_bytes: [u8; 4] = unsafe {
             std::mem::transmute(self.contents)
         };
@@ -58,63 +58,52 @@ impl Message {
         bytes
     }
 
-    fn from_bytes(bytes: [u8; 5]) -> Message {
-        assert_eq!(bytes.len(), 5);
-        let id = bytes[0];
+    fn from_bytes(bytes: [u8; 4]) -> Message {
+        assert_eq!(bytes.len(), 4);
         let mut contents: i32 = 0;
-        for byte in &bytes[1..] {
+        for byte in &bytes[..] {
             contents <<= 8;
             contents += *byte as i32;
         }
-        Message { id, contents }
+        Message { contents }
     }
 }
 
 #[no_mangle]
 pub extern "C"
-fn server_start() -> ServerHandle {
-    let instance = Server::new();
+fn server_start(address: *const c_char) -> ServerHandle {
+    let address = unsafe {
+        CStr::from_ptr(address).to_string_lossy().into_owned()
+    };
+
+    let instance = Server::new(address);
     thread::sleep(time::Duration::from_millis(50));
 
-    println!("Counts: {}, {}", Arc::strong_count(&instance),
-    Arc::weak_count(&instance));
     // pass raw pointer to caller to act as handle
     Arc::into_raw(instance)
 }
 
 #[no_mangle]
 pub extern "C"
-fn server_poll(ptr_handle: ServerHandle ) -> i32 {
+fn server_poll(ptr_handle: ServerHandle) -> i32 {
     let handle = unsafe { &*ptr_handle };
-    let result = {
-        let lock = handle.queue.try_lock();
-        if let Ok(mut queue) = lock {
-            match queue.pop() {
-                Some(msg) => msg.contents,
-                None => -1
-            }
-        } else {
-            -1
-        }
-        //lock.unwrap().pop().unwrap().contents
-
-        /*
-        match lock.unwrap().pop() {
-            Some(v) => v.contents,
+    let lock = handle.queue.try_lock();
+    if let Ok(mut queue) = lock {
+        match queue.pop_front() {
+            Some(msg) => msg.contents,
             None => -1
         }
-        */
-    };
-
-    result
+    } else {
+        -1
+    }
 }
 
 #[no_mangle]
 pub extern "C"
-fn server_send(contents: i32) {
-    let mut stream = TcpStream::connect("127.0.0.1:9001").unwrap();
-    let msg = Message { id: 2, contents };
-    let _ = stream.write(&msg.to_bytes());
+fn server_send(handle: ServerHandle, recipient: u8, contents: i32) {
+    let handle = unsafe { &*handle };
+    let msg = Message { contents };
+    handle.add_send_job(recipient, msg);
 }
 
 #[no_mangle]
@@ -124,21 +113,21 @@ fn server_close(handle: ServerHandle ) {
     //let handle = unsafe { Arc::from_raw(handle) };
     let handle = unsafe { &*handle };
     handle.close();
-
 }
 
 impl Server {
-    fn new() -> Arc<Server> {
+    fn new(address: String) -> Arc<Server> {
         let (sender, receiver) = mpsc::channel();
         let instance = Arc::new(Server {
             threads: Mutex::new(Vec::new()),
-            connections: Mutex::new(Vec::new()),
-            queue: Mutex::new(Vec::new())
+            connections: Mutex::new(HashMap::new()),
+            queue: Mutex::new(VecDeque::new()),
+            jobs: Mutex::new(VecDeque::new())
         });
 
         let listener_ref = instance.clone();
         instance.threads.lock().unwrap().push(thread::spawn(
-            move || { Server::listen(listener_ref, sender); }
+            move || { Server::listen(listener_ref, address, sender); }
         ));
 
         let worker_ref = instance.clone();
@@ -149,21 +138,40 @@ impl Server {
         instance
     }
 
-    fn close(&self) {
-        println!("Closing");
+    fn add_send_job(&self, recipient: ConnId, msg: Message) {
+        self.jobs.lock().unwrap().push_back(Job::Send(recipient, msg));
     }
 
-    fn listen(this: Arc<Server>, _sender: mpsc::Sender<Connection>) {
+    fn close(&self) {
+        println!("Closing. Heheh.");
+    }
+
+    fn send(&self, recipient: ConnId, msg: Message) {
+        match self.connections.lock().unwrap().get_mut(&recipient) {
+            Some(ref mut conn) => {
+                let _ = conn.stream.write(&msg.to_bytes());
+            },
+            None => println!("Error: Trying to send msg to invalid conn")
+        }
+    }
+
+    fn listen(this: Arc<Server>,
+              address: String,
+              _sender: mpsc::Sender<Connection>) {
         println!("Listener thread spawned.");
-        let listener = TcpListener::bind("127.0.0.1:9001").unwrap();
+        let listener = TcpListener::bind(address).unwrap();
+        let mut id: u8 = 0;
         for stream in listener.incoming() {
             println!("Received connection");
-            this.connections.lock().unwrap().push(Connection {
-                id: 0,
-                stream: stream.unwrap()
-            });
+            let stream = stream.unwrap();
+            stream.set_nonblocking(true).expect("nonblocking failed");
+            this.connections.lock().unwrap().insert(
+                id, 
+                Connection { stream }
+            );
 
-            println!("Added connection");
+            println!("Added connection, id {}", id);
+            id += 1;
         }
     }
 
@@ -171,51 +179,104 @@ impl Server {
         println!("Worker thread spawned.");
         // Need to check for new connections every loop the worker does.
         loop {
-            /*
-            match receiver.try_recv() { Ok(v) => {
-                println!("Worker received: {:?}", v);
-                connections.push(v);
-            }, Err(_) => { /* no new connections */ } }
-            */
-
             // TODO: Handle case where connection has been closed
             {
                 let mut locked_connections = this.connections.lock().unwrap();
-                for conn in locked_connections.iter_mut() {
-                    // TODO: May have received more than one message at a time
-                    // This should always be a multiple of 5 bytes atm, so read
-                    // 5 bytes at a time
-                    let mut bytes: [u8; 5] = [0; 5];
-                    while conn.stream.read(&mut bytes).unwrap() != 0 {
+                let mut bytes: [u8; 4] = [0; 4];
+                for (_, conn) in locked_connections.iter_mut() {
+                    // TODO: Account for invalid messages
+                    while let Ok(v) = conn.stream.read(&mut bytes) {
+                        if v == 0 { break; }
                         let msg = Message::from_bytes(bytes);
-                        this.queue.lock().unwrap().push(msg);
-                        println!("Added message to queue");
+                        this.queue.lock().unwrap().push_back(msg);
                     }
                 }
             }
 
-            // 60 ticks/second or so right now
-            thread::sleep(time::Duration::from_millis(16));
+            {
+                let mut locked_jobs = this.jobs.lock().unwrap();
+                while locked_jobs.len() > 0 {
+                    match locked_jobs.pop_front().unwrap() {
+                        Job::Send(recipient, msg) => this.send(recipient, msg)
+                        //_ => {}
+                    }
+                }
+            }
+
+
+            thread::sleep(time::Duration::from_millis(1));
         }
     }
 }
 
-/*
-fn handle_request(stream: TcpStream) {
-    println!("Received: ");
-    for byte in stream.bytes() {
-        println!("{}", byte.unwrap());
-    }
-}
-*/
-
-
-
 
 #[cfg(test)]
 mod tests {
+    use std::io::prelude::*;
+    use std::net::TcpStream;
+    use std::thread;
+    use std::time;
+    use std::ffi::CString;
+
+    use Message;
+    use server_start;
+    use server_send;
+    use server_poll;
+    use server_close;
+
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn mobile_to_unity() {
+        let address = "127.0.0.1:9069";
+        let address_cstr = CString::new(address).unwrap();
+        let handle = server_start(address_cstr.as_ptr());
+        thread::sleep(time::Duration::from_millis(100));
+        let mut stream = TcpStream::connect(address).unwrap();
+
+        let val_limit = 50;
+        let vals: Vec<i32> = (0..val_limit).collect();
+        for val in vals.iter() {
+            let msg = Message { contents: *val };
+            let _ = stream.write(&msg.to_bytes());
+        }
+
+        thread::sleep(time::Duration::from_millis(100));
+
+        let mut results = Vec::new();
+        let mut result: i32 = 0;
+        while result != -1 {
+            result = server_poll(handle);
+            results.push(result);
+        }
+        results.pop();
+        server_close(handle);
+        assert_eq!(vals, results);
+    }
+
+    #[test]
+    fn unity_to_mobile() {
+        let address = "127.0.0.1:9070";
+        let address_cstr = CString::new(address).unwrap();
+        let handle = server_start(address_cstr.as_ptr());
+        thread::sleep(time::Duration::from_millis(100));
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream.set_nonblocking(true).expect("nonblocking failed");
+
+        let val_limit = 50;
+        let vals: Vec<i32> = (0..val_limit).collect();
+        for val in vals.iter() {
+            server_send(handle, 0, *val);
+        }
+
+        thread::sleep(time::Duration::from_millis(100));
+
+        let mut bytes: [u8; 4] = [0; 4];
+        let mut results = Vec::new();
+        while let Ok(v) = stream.read(&mut bytes) {
+            if v == 0 { break; }
+            let msg = Message::from_bytes(bytes);
+            results.push(msg.contents);
+        }
+
+        assert_eq!(vals, results);
     }
 }
