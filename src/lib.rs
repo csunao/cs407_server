@@ -1,6 +1,7 @@
 mod packet;
+mod connection;
 
-use std::net::{UdpSocket, SocketAddr};
+use std::net::UdpSocket;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::collections::{HashMap, VecDeque};
@@ -8,37 +9,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 
 use packet::*;
-
-/* API
- * server_start() -> handle
- * server_send(handle, client_id, data_ptr, data_len)
- * server_poll(handle, &data_ptr) -> data_len
- * server_dealloc(handle, data_ptr, data_len)
- * server_close(handle)
- */
-
-/* PACKET STRUCTURE (in order):
- * You have to use this structure or your packets will not be recognised
- *
- * 32 bits: Protocol ID (0xFEEFBAAB)
- * 8 bits:  Packet type (see packet.rs)
- * 
- * If packet type is Confirm:
- * 8 bits:  Client ID
- *
- * If packet type is Payload:
- * 8 bits: Payload size (in bytes)
- * (8*payload_size) bits: Payload
- *
- * TODO: KeepAlive packets, disconnect packets, limit # connections, sequences
- *       and a ton of other stuff
- */
-
-/* To compile,
- * cargo build --release
- * then lib will be in release/target/ (.so)
- * if you need different library format idk yet
- */
+use connection::*;
 
 const PROTOCOL_ID: u32 = 0xFEEFBAAB;
 
@@ -46,11 +17,6 @@ type ServerHandle = *const Server;
 type ConnId = u8;
 enum Job {
     Send(ConnId, Vec<u8>)
-}
-
-#[derive(Debug)]
-struct Connection {
-    address: SocketAddr
 }
 
 pub struct Server {
@@ -99,7 +65,7 @@ fn server_poll(handle: ServerHandle, out_ptr: *mut (*mut u8)) -> u8 {
 pub extern "C"
 fn server_dealloc(ptr: *mut u8, len: u8) {
     let len = len as usize;
-    unsafe { drop(Vec::from_raw_parts(ptr, len, len)) }
+    drop(unsafe { Vec::from_raw_parts(ptr, len, len) });
 }
 
 #[no_mangle]
@@ -148,18 +114,16 @@ impl Server {
     }
 
     fn close(&self) {
+        //for thread in self.threads.lock().unwrap().into_iter() {
+            //thread.join().unwrap();
+        //}
     }
 
     fn send(&self, recipient: ConnId, bytes: Vec<u8>) {
         match self.connections.lock().unwrap().get_mut(&recipient) {
-            Some(ref conn) => {
-                let mut buf = [0; 256];
-                let len = bytes.len() + 6;
-                let _ = encode(&mut buf[..], PROTOCOL_ID, &Packet::Payload(PayloadPacket{bytes}));
-                let mut buf = buf.to_vec();
-                buf.truncate(len);
-                let _ = self.socket.send_to(&buf[..], conn.address);
-                println!("ok sent thing {:?}", &buf[..]);
+            Some(ref mut conn) => {
+                conn.send(&Packet::Payload(PayloadPacket { bytes }),
+                          &self.socket).unwrap();
             },
             None => println!("Error: Trying to send msg to invalid conn
                               {:?}", recipient)
@@ -171,11 +135,15 @@ impl Server {
     }
 
     fn perform_job(&self) {
-        let mut locked_jobs = self.jobs.lock().unwrap();
-        while locked_jobs.len() > 0 {
-            match locked_jobs.pop_front().unwrap() {
-                Job::Send(recipient, bytes) => self.send(recipient, bytes)
-                //_ => {}
+        let job = {
+            let mut locked_jobs = self.jobs.lock().unwrap();
+            if locked_jobs.len() == 0 { return };
+            locked_jobs.pop_front().unwrap()
+        };
+
+        match job {
+            Job::Send(recipient, bytes) => {
+                self.send(recipient, bytes);
             }
         }
     }
@@ -190,21 +158,41 @@ impl Server {
         let mut buf = [0; 256];
         loop {
             let (_, address) = socket.recv_from(&mut buf).unwrap();
-            let (_, packet) = decode(&buf[..], PROTOCOL_ID).unwrap();
+
+            let mut conns = this.connections.lock().unwrap();
+
+            if !address_to_id.contains_key(&address) {
+                let (_, packet) = decode(&buf[..], PROTOCOL_ID).unwrap();
+                if let Packet::Connect = packet {
+                    println!("New connection -- sending confirm to {:?}", id);
+                    conns.insert(
+                        id,
+                        Connection::new(&address, id, PROTOCOL_ID)
+                    );
+                    let connection = conns.get_mut(&id).unwrap();
+                    address_to_id.insert(address, id);
+                    id += 1;
+                    let _ = connection.send(
+                        &Packet::Confirm(ConfirmPacket { client_id: id }),
+                        &socket
+                    );
+                }
+                
+                continue
+            };
+
+            let connection = conns.get_mut(address_to_id.get(&address).unwrap()).unwrap();
+
+            let packet = connection.recv(&buf).unwrap();
 
             match packet {
                 Packet::Connect => {
-                    println!("Received init -- sending ack to {:?}", id);
-                    this.connections.lock().unwrap().insert(
-                        id,
-                        Connection { address }
+                    // Resend confirmation, must have been lost
+                    let client_id = connection.get_id();
+                    let _ = connection.send(
+                        &Packet::Confirm(ConfirmPacket { client_id }),
+                        &socket
                     );
-                    address_to_id.insert(address, id);
-                    id += 1;
-                    let mut response_buf = [0; 5];
-                    let size = encode(&mut response_buf[..], PROTOCOL_ID, &Packet::Confirm(ConfirmPacket { client_id: id })).unwrap();
-                    assert_eq!(size, 5);
-                    let _ = socket.send_to(&response_buf, &address);
                 },
 
                 Packet::Payload(payload) => {
@@ -224,7 +212,7 @@ impl Server {
         }
     }
 
-    // Aiming for 64 tick rate
+    // Aiming for 64 tick rate?
     fn work(this: Arc<Server>, sender: mpsc::Sender<()>) {
         let _ = sender.send(());
         loop {
@@ -255,18 +243,20 @@ mod tests {
         let _ = socket.connect(server);
         let mut buf = [0; 6];
         let _ = encode(&mut buf[..], PROTOCOL_ID, &Packet::Connect);
-        println!("wrote: {:?}", &buf[..]);
 
         let _ = socket.send(&buf[..]);
         let _ = socket.recv(&mut buf);
         let (_, response) = decode(&buf[..], PROTOCOL_ID).unwrap();
         assert_eq!(response.get_type_id(), PACKET_CONFIRM);
-        if let Packet::Confirm(ref ins) = response {
-            println!("our id: {:?}", &ins.client_id);
-        }
-        println!("acked with server successfully");
 
-        socket
+        match response {
+            Packet::Confirm(ref ins) => {
+                println!("Connected to server as client {}", &ins.client_id);
+                socket
+            },
+            Packet::Deny => panic!("connection denied"),
+            _ => panic!("invalid response to connect")
+        }
     }
 
     #[test]
@@ -292,13 +282,14 @@ mod tests {
         let mut sent_packet_bytes = [0; 5+1+2];
         encode(&mut sent_packet_bytes[..], PROTOCOL_ID, &sent_packet).unwrap();
 
+        println!("zzz sending {:?}", &sent_packet_bytes[..]);
         client.send(&sent_packet_bytes[..]).unwrap();
 
         let bytes_ptr = other_sent_data.as_ptr();
         let bytes_count = other_sent_data.len() as u32;
         server_send(handle, 0, bytes_ptr, bytes_count);
 
-        thread::sleep(time::Duration::from_millis(10));
+        thread::sleep(time::Duration::from_millis(100));
 
         let mut ptr: *mut u8 = ptr::null_mut();
         let len = server_poll(handle, &mut ptr as *mut *mut u8) as usize;

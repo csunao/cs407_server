@@ -1,10 +1,10 @@
 use std::io;
 
-pub const PACKET_CONNECT: u8 = 0;
-pub const PACKET_CONFIRM: u8 = 1;
-pub const PACKET_DENY: u8 = 2;
-pub const PACKET_KEEPALIVE: u8 = 3;
-pub const PACKET_PAYLOAD: u8 = 4;
+pub const PACKET_CONNECT:    u8 = 0;
+pub const PACKET_CONFIRM:    u8 = 1;
+pub const PACKET_DENY:       u8 = 2;
+pub const PACKET_KEEPALIVE:  u8 = 3;
+pub const PACKET_PAYLOAD:    u8 = 4;
 pub const PACKET_DISCONNECT: u8 = 5;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,12 +40,18 @@ pub fn decode(data: &[u8], protocol_id: u32) -> Result<(u64, Packet), PacketErro
     }
 
     match packet_type {
-        PACKET_CONNECT => Ok(Packet::Connect),
-        PACKET_CONFIRM => Ok(Packet::Confirm(ConfirmPacket::from(&mut source).unwrap())),
-        PACKET_DENY => Ok(Packet::Deny),
-        PACKET_KEEPALIVE => Ok(Packet::KeepAlive),
-        PACKET_PAYLOAD => Ok(Packet::Payload(PayloadPacket::from(&mut source).unwrap())),
-        PACKET_DISCONNECT => Ok(Packet::Disconnect),
+        PACKET_CONNECT =>
+            Ok(Packet::Connect),
+        PACKET_CONFIRM =>
+            Ok(Packet::Confirm(ConfirmPacket::from(&mut source).unwrap())),
+        PACKET_DENY =>
+            Ok(Packet::Deny),
+        PACKET_KEEPALIVE =>
+            Ok(Packet::KeepAlive),
+        PACKET_PAYLOAD =>
+            Ok(Packet::Payload(PayloadPacket::from(&mut source).unwrap())),
+        PACKET_DISCONNECT =>
+            Ok(Packet::Disconnect),
         _ => Err(PacketError::InvalidPacket)
     }.map(|p| (0, p))
 }
