@@ -57,7 +57,7 @@ fn client_poll(handle: *const Client, out_ptr: *mut (*mut u8)) -> usize {
     match handle.poll() {
         Some(mut bytes) => {
             bytes.shrink_to_fit();
-            let len = bytes.len()
+            let len = bytes.len();
             unsafe { *out_ptr = bytes.as_mut_ptr() };
             std::mem::forget(bytes);
             len
@@ -178,27 +178,6 @@ mod tests {
 
     use packet::*;
 
-    fn connect(server: &str, client: &str) -> UdpSocket {
-        let socket = UdpSocket::bind(client).unwrap();
-        let _ = socket.connect(server);
-        let mut buf = [0; 6];
-        let _ = encode(&mut buf[..], PROTOCOL_ID, &Packet::Connect);
-
-        let _ = socket.send(&buf[..]);
-        let _ = socket.recv(&mut buf);
-        let (_, response) = decode(&buf[..], PROTOCOL_ID).unwrap();
-        assert_eq!(response.get_type_id(), PACKET_CONFIRM);
-
-        match response {
-            Packet::Confirm(ref ins) => {
-                println!("Connected to server as client {}", &ins.client_id);
-                socket
-            },
-            Packet::Deny => panic!("connection denied"),
-            _ => panic!("invalid response to connect")
-        }
-    }
-
     #[test]
     fn client_test() {
         let (server, client) = {
@@ -253,62 +232,5 @@ mod tests {
 
         client_disconnect(client);
         client_close(client);
-    }
-
-    #[test]
-    fn udp_test() {
-        let port = 9420;
-        let s_addr = format!("{}:{}", "127.0.0.1", port.to_string());
-        let s_addr_cstr = CString::new(&s_addr[..]).unwrap();
-        let handle = server_start(s_addr_cstr.as_ptr());
-
-        let client = connect(&s_addr[..], "127.0.0.1:9421");
-
-        let other_sent_data = vec![96, 69];
-        let sent_data = vec![42, 24];
-        let sent_packet = Packet::Payload(PayloadPacket { bytes: sent_data.clone() });
-        let mut sent_packet_bytes = [0; 5+1+2];
-        encode(&mut sent_packet_bytes[..], PROTOCOL_ID, &sent_packet).unwrap();
-
-        println!("zzz sending {:?}", &sent_packet_bytes[..]);
-        client.send(&sent_packet_bytes[..]).unwrap();
-
-        let bytes_ptr = other_sent_data.as_ptr();
-        let bytes_count = other_sent_data.len();
-        server_send_to(handle, 0, bytes_ptr, bytes_count);
-
-        thread::sleep(Duration::from_millis(100));
-
-        let mut ptr: *mut u8 = ptr::null_mut();
-        let len = server_poll(handle, &mut ptr as *mut *mut u8) as usize;
-        assert!(len != 0);
-
-        let data = unsafe { Vec::from_raw_parts(ptr, len, len) };
-        assert_eq!(data, sent_data);
-        drop(data);
-
-        let mut buf = [0; 256];
-        let time = time::precise_time_s();
-        let mut cur_time = time;
-        while cur_time < time + 10.0 {
-            client.recv_from(&mut buf[..]).unwrap();
-            let (_, packet) = decode(&buf[..], PROTOCOL_ID).unwrap();
-            println!("received {:?}", packet);
-            match packet {
-                Packet::KeepAlive => {
-                    let mut buf = [0; 5];
-                    let _ = encode(&mut buf[..], PROTOCOL_ID, &Packet::KeepAlive);
-                    client.send(&buf[..]).unwrap();
-                },
-                Packet::Disconnect => {
-                    panic!("we were disconnected");
-                },
-                _ => ()
-            }
-
-            cur_time = time::precise_time_s();
-        }
-
-        server_close(handle);
     }
 }
