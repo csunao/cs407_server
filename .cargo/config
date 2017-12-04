@@ -1,0 +1,3 @@
+[target.arm-linux-androideabi]
+ar = "/opt/android-ndk/toolchains/arm-linux/androideabi-4.9/prebuilt/linux-x86-64/bin/arm-linux-androideabi-ar"
+linker = "/home/kyrime/bin/ndk-standalone-14-arm/bin/arm-linux-androideabi-gcc"

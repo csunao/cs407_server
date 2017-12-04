@@ -24,6 +24,20 @@ type ServerHandle = *const Server;
 // client_disconnect(handle) --- done
 // client_close(handle) --- done
 
+#[cfg(target_os="android")]
+#[allow(non_snake_case)]
+pub mod android {
+    extern crate jni;
+
+    use self::jni::JNIEnv;
+
+    #[no_mangle]
+    pub extern "C"
+    fn Java_wtf(env: JNIEnv) {
+        println!("wtf are we doing with our lives?");
+    }
+}
+
 #[no_mangle]
 pub extern "C"
 fn client_connect(server: *const c_char, client: *const c_char) -> *const Client {
