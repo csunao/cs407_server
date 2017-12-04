@@ -5,3 +5,6 @@ authors = ["Hugh <hugh.r.harrington@dcs.warwick.ac.uk>"]
 
 [lib]
 crate-type = ["dylib"]
+
+[dependencies]
+time = "0.1.38"

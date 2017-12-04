@@ -1,38 +1,72 @@
-API
----
+Server API
+----------
 
-(subject to change...)
-
+Starts server -- returns pointer used as handle in all other functions (except dealloc). Address format is e.g. 127.0.0.1:9000
 ```c
-void* server_start();
-void server_send(void* handle, uint8_t client_id, uint8_t* data_ptr, size_t data_len);
+void* server_start(const char* address);
+```
+
+Send a message (a sequence of bytes) to all clients.
+```c
+void server_send(void* handle, uint8_t* data_ptr, size_t data_len);
+```
+
+Send a message (a sequence of bytes) to a specific client.
+```c
+void server_send_to(void* handle, uint8_t client_id, uint8_t* data_ptr, size_t data_len);
+```
+
+Poll the server for incoming messages. Result indicates length of message (in bytes) to be used to read that many bytes at `data_ptr`. All messages returned by this function must be deallocated by calling `server_dealloc` with the same pointer and length.
+```c
 size_t server_poll(void* handle, uint8_t** data_ptr);
-void server_dealloc(void* handle, uint8_t data_ptr, size_t data_len);
+```
+
+Deallocate a message that was originally allocated on Rust side and so needs to be deallocated by Rust (all messages returned by `server_poll`).
+```c
+void server_dealloc(uint8_t* data_ptr, size_t data_len);
+```
+
+Close the server, deallocating resources and closing threads.
+```c
 void server_close(void* handle);
 ```
 
-Packet Structure
-----------------
+Client API
+----------
 
-You have to use this structure or your packets will not be recognised. Listed in order they will be read. Numbers are sent big endian.
-
-Header:
-```
-32 bits: protocol_id (currently 0xFEEFBAAB)
-8 bits: packet_type (see src/packet.rs)
+Starts client -- returns pointer used as handle in all other functions (except dealloc). Address format is e.g. 127.0.0.1:9000, and ports can't be same for server & client in UDP
+```c
+void* client_connect(const char* server_address, const char* client_address);
 ```
 
-Followed by either nothing or a structure dependent on packet_type:
-
-If packet type is Confirm:
-```
-8 bits: client_id
+Send a message (a sequence of bytes) to the server.
+```c
+void client_send(void* handle, uint8_t* data_ptr, size_t data_len);
 ```
 
-If packet type is Payload:
+Poll the client for incoming messages. Result indicates length of message (in bytes) to be used to read that many bytes at `data_ptr`. All messages returned by this function must be deallocated by calling `client_dealloc` with the same pointer and length.
+```c
+size_t client_poll(void* handle, uint8_t** data_ptr);
 ```
-8 bits: payload_size (in bytes)
-8*payload_size bits: payload (a load of bytes you have to make sense of)
+
+Deallocate a message that was originally allocated on Rust side and so needs to be deallocated by Rust (all messages returned by `client_poll`).
+```c
+void client_dealloc(uint8_t* data_ptr, size_t data_len);
+```
+
+returns this client's id
+```c
+uint8_t client_id(void* handle);
+```
+
+Disconnect cleanly from the server, sending packet to indicate disconnecting.
+```c
+void client_disconnect(void* handle);
+```
+
+Deallocate resources and close thread.
+```c
+void client_close(void* handle);
 ```
 
 Compiling
@@ -49,6 +83,4 @@ cargo build --release
 todo
 ----
 
-keepalive packets, disconnect packets, limit number of connections, sequences and a ton of other stuff
-
-also a lot of cleaning up lol
+limit number of connections, sequencing packets, possibly attempt to reconnect if disconnected through keepalive packets, cleaning up

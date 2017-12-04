@@ -1,30 +1,90 @@
 mod packet;
 mod connection;
+mod server;
+mod client;
 
-use std::net::UdpSocket;
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
-use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use std::sync::Arc;
 
-use packet::*;
-use connection::*;
-
-const PROTOCOL_ID: u32 = 0xFEEFBAAB;
+use server::*;
+use client::*;
 
 type ServerHandle = *const Server;
-type ConnId = u8;
-enum Job {
-    Send(ConnId, Vec<u8>)
+
+// types
+// client id should be size_t really..? nah, u8 is fine.
+
+// Client API
+// client_connect(server_address, client_address) -> handle --- done
+// client_send(handle, bytes, len) --- done
+// client_poll(handle, bytes) -> len --- done
+// client_dealloc(bytes, len) --- done
+// client_id(handle) -> u8 --- done
+// client_disconnect(handle) --- done
+// client_close(handle) --- done
+
+#[no_mangle]
+pub extern "C"
+fn client_connect(server: *const c_char, client: *const c_char) -> *const Client {
+    let server = unsafe { CStr::from_ptr(server).to_string_lossy().into_owned() };
+    let client = unsafe { CStr::from_ptr(client).to_string_lossy().into_owned() };
+
+    let instance = Client::new(server, client, PROTOCOL_ID).unwrap();
+    Arc::into_raw(instance)
 }
 
-pub struct Server {
-    socket: UdpSocket,
-    threads: Mutex<Vec<thread::JoinHandle<()>>>,
-    connections: Mutex<HashMap<ConnId, Connection>>,
-    queue: Mutex<VecDeque<Vec<u8>>>,
-    jobs: Mutex<VecDeque<Job>>
+#[no_mangle]
+pub extern "C"
+fn client_send(handle: *const Client, bytes: *const u8, byte_count: usize) {
+    let handle = unsafe { &*handle };
+    let byte_vec = unsafe { std::slice::from_raw_parts(bytes, byte_count as usize) }.to_vec();
+    let _ = handle.send(byte_vec);
+}
+
+#[no_mangle]
+pub extern "C"
+fn client_id(handle: *const Client) -> u8 {
+    let handle = unsafe { &* handle };
+    handle.get_id()
+}
+
+#[no_mangle]
+pub extern "C"
+fn client_poll(handle: *const Client, out_ptr: *mut (*mut u8)) -> usize {
+    let handle = unsafe { &*handle };
+
+    match handle.poll() {
+        Some(mut bytes) => {
+            bytes.shrink_to_fit();
+            let len = bytes.len()
+            unsafe { *out_ptr = bytes.as_mut_ptr() };
+            std::mem::forget(bytes);
+            len
+        }
+        None => 0
+    }
+}
+
+#[no_mangle]
+pub extern "C"
+fn client_dealloc(ptr: *mut u8, len: u8) {
+    let len = len as usize;
+    drop(unsafe { Vec::from_raw_parts(ptr, len, len) });
+}
+
+#[no_mangle]
+pub extern "C"
+fn client_disconnect(handle: *const Client) {
+    let handle = unsafe { &*handle };
+    handle.disconnect();
+}
+
+#[no_mangle]
+pub extern "C"
+fn client_close(handle: *const Client) {
+    //let handle = unsafe { &*handle };
+    drop(unsafe { Arc::from_raw(handle) });
 }
 
 #[no_mangle]
@@ -44,20 +104,16 @@ fn server_start(address: *const c_char) -> ServerHandle {
 pub extern "C"
 fn server_poll(handle: ServerHandle, out_ptr: *mut (*mut u8)) -> u8 {
     let handle = unsafe { &*handle };
-    let lock = handle.queue.lock();
-    if let Ok(mut queue) = lock {
-        match queue.pop_front() {
-            Some(mut bytes) => {
-                bytes.shrink_to_fit();
-                let len = bytes.len() as u8;
-                unsafe { *out_ptr = bytes.as_mut_ptr() };
-                std::mem::forget(bytes);
-                len
-            }
-            None => 0
+
+    match handle.poll() {
+        Some(mut bytes) => {
+            bytes.shrink_to_fit();
+            let len = bytes.len() as u8;
+            unsafe { *out_ptr = bytes.as_mut_ptr() };
+            std::mem::forget(bytes);
+            len
         }
-    } else {
-        0
+        None => 0
     }
 }
 
@@ -70,8 +126,16 @@ fn server_dealloc(ptr: *mut u8, len: u8) {
 
 #[no_mangle]
 pub extern "C"
-fn server_send(handle: ServerHandle, recipient: ConnId,
-               bytes: *const u8, byte_count: u32) {
+fn server_send(handle: ServerHandle, bytes: *const u8, byte_count: usize) {
+    let handle = unsafe { &*handle };
+    let byte_vec = unsafe { std::slice::from_raw_parts(bytes, byte_count as usize) }.to_vec();
+    handle.add_send_all_job(byte_vec);
+}
+
+#[no_mangle]
+pub extern "C"
+fn server_send_to(handle: ServerHandle, recipient: ConnId,
+               bytes: *const u8, byte_count: usize) {
     let handle = unsafe { &*handle };
     let byte_vec = unsafe { std::slice::from_raw_parts(bytes, byte_count as usize) }.to_vec();
     handle.add_send_job(recipient, byte_vec);
@@ -80,161 +144,37 @@ fn server_send(handle: ServerHandle, recipient: ConnId,
 #[no_mangle]
 pub extern "C"
 fn server_close(handle: ServerHandle ) {
-    let handle = unsafe { &*handle };
-    handle.close();
-}
-
-impl Server {
-    fn new(address: String) -> Arc<Server> {
-        let (sender, receiver) = mpsc::channel();
-        let instance = Arc::new(Server {
-            socket: UdpSocket::bind(address).unwrap(),
-            threads: Mutex::new(Vec::new()),
-            connections: Mutex::new(HashMap::new()),
-            queue: Mutex::new(VecDeque::new()),
-            jobs: Mutex::new(VecDeque::new())
-        });
-
-        let listener_ref = instance.clone();
-        let listener_sender = sender.clone();
-        instance.threads.lock().unwrap().push(thread::spawn(
-            move || { Server::listen(listener_ref, listener_sender); }
-        ));
-
-        let worker_ref = instance.clone();
-        let worker_sender = sender.clone();
-        instance.threads.lock().unwrap().push(thread::spawn(
-            move || { Server::work(worker_ref, worker_sender); }
-        ));
-
-        let _ = receiver.recv();
-        let _ = receiver.recv();
-
-        instance
+    {
+        let handle = unsafe { &*handle };
+        handle.close();
     }
-
-    fn close(&self) {
-        //for thread in self.threads.lock().unwrap().into_iter() {
-            //thread.join().unwrap();
-        //}
-    }
-
-    fn send(&self, recipient: ConnId, bytes: Vec<u8>) {
-        match self.connections.lock().unwrap().get_mut(&recipient) {
-            Some(ref mut conn) => {
-                conn.send(&Packet::Payload(PayloadPacket { bytes }),
-                          &self.socket).unwrap();
-            },
-            None => println!("Error: Trying to send msg to invalid conn
-                              {:?}", recipient)
-        }
-    }
-
-    fn add_send_job(&self, recipient: ConnId, bytes: Vec<u8>) {
-        self.jobs.lock().unwrap().push_back(Job::Send(recipient, bytes));
-    }
-
-    fn perform_job(&self) {
-        let job = {
-            let mut locked_jobs = self.jobs.lock().unwrap();
-            if locked_jobs.len() == 0 { return };
-            locked_jobs.pop_front().unwrap()
-        };
-
-        match job {
-            Job::Send(recipient, bytes) => {
-                self.send(recipient, bytes);
-            }
-        }
-    }
-
-    // processes messages
-    fn listen(this: Arc<Server>, sender: mpsc::Sender<()>) {
-        let socket = this.socket.try_clone().unwrap();
-        let mut address_to_id = HashMap::new();
-        let _ = sender.send(());
-        let mut id: u8 = 0;
-
-        let mut buf = [0; 256];
-        loop {
-            let (_, address) = socket.recv_from(&mut buf).unwrap();
-
-            let mut conns = this.connections.lock().unwrap();
-
-            if !address_to_id.contains_key(&address) {
-                let (_, packet) = decode(&buf[..], PROTOCOL_ID).unwrap();
-                if let Packet::Connect = packet {
-                    println!("New connection -- sending confirm to {:?}", id);
-                    conns.insert(
-                        id,
-                        Connection::new(&address, id, PROTOCOL_ID)
-                    );
-                    let connection = conns.get_mut(&id).unwrap();
-                    address_to_id.insert(address, id);
-                    id += 1;
-                    let _ = connection.send(
-                        &Packet::Confirm(ConfirmPacket { client_id: id }),
-                        &socket
-                    );
-                }
-                
-                continue
-            };
-
-            let connection = conns.get_mut(address_to_id.get(&address).unwrap()).unwrap();
-
-            let packet = connection.recv(&buf).unwrap();
-
-            match packet {
-                Packet::Connect => {
-                    // Resend confirmation, must have been lost
-                    let client_id = connection.get_id();
-                    let _ = connection.send(
-                        &Packet::Confirm(ConfirmPacket { client_id }),
-                        &socket
-                    );
-                },
-
-                Packet::Payload(payload) => {
-                    println!("Got a payload!!");
-                    println!("{:?}", &payload);
-                    this.queue.lock().unwrap().push_back(payload.bytes);
-                },
-
-                Packet::Disconnect => {
-                    /* remove connection */
-                },
-
-                msg => {
-                    println!("Received invalid msg ({:?})", msg);
-                }
-            }
-        }
-    }
-
-    // Aiming for 64 tick rate?
-    fn work(this: Arc<Server>, sender: mpsc::Sender<()>) {
-        let _ = sender.send(());
-        loop {
-            this.perform_job();
-        }
-    }
+    drop(unsafe { Arc::from_raw(handle) });
 }
 
 #[cfg(test)]
 mod tests {
+    extern crate time;
+
     use std::net::UdpSocket;
     use std::thread;
-    use std::time;
+    use std::time::Duration;
     use std::ffi::CString;
     use std::ptr;
 
     use server_start;
-    use server_send;
+    use server_send_to;
     use server_poll;
     use server_close;
 
-    use PROTOCOL_ID;
+    use client_connect;
+    use client_send;
+    use client_poll;
+    use client_dealloc;
+    use client_id;
+    use client_disconnect;
+    use client_close;
+
+    use server::PROTOCOL_ID;
 
     use packet::*;
 
@@ -260,11 +200,59 @@ mod tests {
     }
 
     #[test]
-    fn packet_header() {
-        let bytes = [0, 0, 0, 69, 0];
-        let (seq, packet) = decode(&bytes[..], 69).unwrap();
-        println!("packet: {:?}, {:?}", seq, packet);
+    fn client_test() {
+        let (server, client) = {
+            let mut port = 9422;
+            let s_addr = format!("{}:{}", "127.0.0.1", port.to_string());
+            let s_addr_cstr = CString::new(&s_addr[..]).unwrap();
+            port += 1;
+            let c_addr = format!("{}:{}", "127.0.0.1", port.to_string());
+            let c_addr_cstr = CString::new(&c_addr[..]).unwrap();
 
+            let server = server_start(s_addr_cstr.as_ptr());
+            let client = client_connect(s_addr_cstr.as_ptr(), c_addr_cstr.as_ptr());
+            (server, client)
+        };
+
+        let sent_data = vec![42, 24];
+        let other_data = vec![96, 69];
+        thread::sleep(Duration::from_millis(30));
+
+        server_send_to(server, 1, sent_data.as_ptr(), sent_data.len());
+        client_send(client, other_data.as_ptr(), other_data.len());
+
+        thread::sleep(Duration::from_millis(30));
+
+        let mut ptr: *mut u8 = ptr::null_mut();
+        let len = client_poll(client, &mut ptr as *mut *mut u8) as usize;
+        client_dealloc(ptr, len as u8);
+
+        println!("we're client number {}", client_id(client));
+
+        thread::sleep(Duration::from_millis(6000));
+
+        loop {
+            let mut ptr: *mut u8 = ptr::null_mut();
+            let len = client_poll(client, &mut ptr as *mut *mut u8) as usize;
+            let data = unsafe { Vec::from_raw_parts(ptr, len, len) };
+            if len == 0 {
+                break;
+            }
+            println!("client got {:?}", data);
+        }
+
+        loop {
+            let mut ptr: *mut u8 = ptr::null_mut();
+            let len = server_poll(server, &mut ptr as *mut *mut u8) as usize;
+            let data = unsafe { Vec::from_raw_parts(ptr, len, len) };
+            if len == 0 {
+                break;
+            }
+            println!("server got {:?}", data);
+        }
+
+        client_disconnect(client);
+        client_close(client);
     }
 
     #[test]
@@ -286,10 +274,10 @@ mod tests {
         client.send(&sent_packet_bytes[..]).unwrap();
 
         let bytes_ptr = other_sent_data.as_ptr();
-        let bytes_count = other_sent_data.len() as u32;
-        server_send(handle, 0, bytes_ptr, bytes_count);
+        let bytes_count = other_sent_data.len();
+        server_send_to(handle, 0, bytes_ptr, bytes_count);
 
-        thread::sleep(time::Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(100));
 
         let mut ptr: *mut u8 = ptr::null_mut();
         let len = server_poll(handle, &mut ptr as *mut *mut u8) as usize;
@@ -300,9 +288,26 @@ mod tests {
         drop(data);
 
         let mut buf = [0; 256];
-        client.recv_from(&mut buf[..]).unwrap();
-        let (_, packet) = decode(&buf[..], PROTOCOL_ID).unwrap();
-        println!("received {:?}", packet);
+        let time = time::precise_time_s();
+        let mut cur_time = time;
+        while cur_time < time + 10.0 {
+            client.recv_from(&mut buf[..]).unwrap();
+            let (_, packet) = decode(&buf[..], PROTOCOL_ID).unwrap();
+            println!("received {:?}", packet);
+            match packet {
+                Packet::KeepAlive => {
+                    let mut buf = [0; 5];
+                    let _ = encode(&mut buf[..], PROTOCOL_ID, &Packet::KeepAlive);
+                    client.send(&buf[..]).unwrap();
+                },
+                Packet::Disconnect => {
+                    panic!("we were disconnected");
+                },
+                _ => ()
+            }
+
+            cur_time = time::precise_time_s();
+        }
 
         server_close(handle);
     }
