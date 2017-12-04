@@ -33,7 +33,7 @@ pub mod android {
 
     #[no_mangle]
     pub extern "C"
-    fn Java_wtf(env: JNIEnv) {
+    fn Java_Client_test(env: JNIEnv) {
         println!("wtf are we doing with our lives?");
     }
 }
