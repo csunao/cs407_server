@@ -157,11 +157,13 @@ fn server_send_to(handle: ServerHandle, recipient: ConnId,
 
 #[no_mangle]
 pub extern "C"
-fn server_close(handle: ServerHandle ) {
+fn server_close(handle: *const Server) {
+    /*
     {
         let handle = unsafe { &*handle };
         handle.close();
     }
+    */
     drop(unsafe { Arc::from_raw(handle) });
 }
 
